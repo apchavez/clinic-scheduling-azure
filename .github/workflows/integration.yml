@@ -1,0 +1,106 @@
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Function App or APIM base URL, for example https://func-clinic-dev.azurewebsites.net/api"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  postman:
+    name: Run Postman collection
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install Newman
+        run: npm install --global newman
+
+      - name: Generate test JWT
+        id: jwt
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          TOKEN=$(node -e '
+            const crypto = require("crypto");
+            const b64url = (buf) => buf.toString("base64url");
+            const header = b64url(Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+            const payload = b64url(Buffer.from(JSON.stringify({
+              sub: "integration-tests",
+              role: "agent",
+              exp: Math.floor(Date.now() / 1000) + 3600,
+            })));
+            const sig = crypto.createHmac("sha256", process.env.JWT_SECRET)
+              .update(`${header}.${payload}`)
+              .digest("base64url");
+            console.log(`${header}.${payload}.${sig}`);
+          ')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Run collection
+        run: >
+          newman run postman/azure-python.postman_collection.json
+          --env-var baseUrl="${{ inputs.base_url }}"
+          --env-var token="${{ steps.jwt.outputs.token }}"
+          --reporters cli,junit
+          --reporter-junit-export newman-results.xml
+
+      - name: Verify async COMPLETED transition via Event Grid
+        run: |
+          set -euo pipefail
+          BASE_URL="${{ inputs.base_url }}"
+          TOKEN="${{ steps.jwt.outputs.token }}"
+
+          CREATE_RESPONSE=$(curl -s -X POST "$BASE_URL/appointments" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"insuredId":"integration-tests","scheduleId":1,"contactEmail":"agent@example.com"}')
+          echo "Create response: $CREATE_RESPONSE"
+          APPOINTMENT_ID=$(node -e "console.log(JSON.parse(process.argv[1]).appointmentId)" "$CREATE_RESPONSE")
+          if [ -z "$APPOINTMENT_ID" ] || [ "$APPOINTMENT_ID" = "undefined" ]; then
+            echo "::error::No appointmentId in create response"
+            exit 1
+          fi
+          echo "Polling history for appointmentId=$APPOINTMENT_ID until APPOINTMENT_COMPLETED appears (worker -> SQL -> Event Grid -> confirmations queue -> confirm function)..."
+
+          for attempt in $(seq 1 20); do
+            HISTORY=$(curl -s "$BASE_URL/appointments/$APPOINTMENT_ID/history" -H "Authorization: Bearer $TOKEN")
+            if echo "$HISTORY" | grep -q "APPOINTMENT_COMPLETED"; then
+              echo "Confirmed: appointment $APPOINTMENT_ID reached APPOINTMENT_COMPLETED via Event Grid (attempt $attempt)."
+              echo "$HISTORY"
+              exit 0
+            fi
+            echo "Attempt $attempt: not COMPLETED yet ($HISTORY) - retrying in 5s..."
+            sleep 5
+          done
+          echo "::error::Appointment $APPOINTMENT_ID never reached APPOINTMENT_COMPLETED after 20 attempts (~100s)"
+          exit 1
+
+      - name: Run k6 load tests
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: tests/load/appointments.js
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          TOKEN: ${{ steps.jwt.outputs.token }}
+
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-test-results
+          path: newman-results.xml
+          if-no-files-found: warn

@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build:
+    name: Build, test and validate API
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          scanners: vuln
+          exit-code: 1
+          ignore-unfixed: true
+          format: table
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint and format check
+        run: |
+          ruff format --check .
+          ruff check .
+
+      - name: Run tests with coverage
+        run: |
+          pytest \
+            --cov=clinic \
+            --cov-report=xml --cov-report=term \
+            --junitxml=test-results.xml
+          coverage report --fail-under=80 --include="clinic/domain/*,clinic/application/*"
+
+      - name: Lint Bicep IaC
+        run: |
+          az bicep install
+          az bicep lint --file infra/main.bicep
+
+      - name: Validate OpenAPI contract
+        run: npx --yes @redocly/cli lint src/docs/openapi.yaml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: warn
+
+      - name: Upload OpenAPI artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: clinic-openapi
+          path: src/docs/openapi.yaml
+          if-no-files-found: error
+
+      - name: SonarCloud analysis
+        if: vars.SONAR_ORGANIZATION != '' && (github.event_name != 'pull_request' || github.actor != 'dependabot[bot]')
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+

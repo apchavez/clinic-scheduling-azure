@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "projectName": { "value": "clinic" },
+    "location": { "value": "eastus" },
+    "environment": { "value": "test" },
+    "appLocation": { "value": "centralus" },
+    "deployApiManagement": { "value": true },
+    "deployAlerts": { "value": false },
+    "allowPublicNetworkAccess": { "value": true }
+  }
+}

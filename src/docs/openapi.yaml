@@ -1,0 +1,409 @@
+openapi: 3.0.3
+info:
+  title: Clinic Scheduling Platform — Azure
+  description: >
+    API para la plataforma de agendamiento de citas médicas migrada a Azure.
+    Expone dos endpoints HTTP; el procesamiento interno es event-driven vía Service Bus.
+  version: 1.0.0
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+  contact:
+    name: Clinic Platform Team
+
+servers:
+  - url: https://func-clinic-dev.azurewebsites.net/api
+    description: Desarrollo (Azure)
+  - url: http://localhost:7071/api
+    description: Local (Azure Functions Core Tools)
+
+tags:
+  - name: Appointments
+    description: Gestión de citas médicas
+  - name: Operations
+    description: Observabilidad y estado del servicio
+
+security: []
+
+paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Estado del servicio
+      description: >
+        Verifica la conectividad con las tres dependencias de infraestructura:
+        Cosmos DB, Azure SQL y Service Bus. Devuelve 200 si todas están activas,
+        503 si alguna está caída.
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Todas las dependencias activas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: "UP"
+                checks:
+                  cosmosDb: "UP"
+                  azureSql: "UP"
+                  serviceBus: "UP"
+                timestamp: "2026-06-28T15:00:00Z"
+        '400':
+          description: Solicitud malformada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '503':
+          description: Una o más dependencias no responden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: "DOWN"
+                checks:
+                  cosmosDb: "UP"
+                  azureSql: "DOWN: Connection refused"
+                  serviceBus: "UP"
+                timestamp: "2026-06-28T15:00:00Z"
+
+  /appointments:
+    post:
+      tags: [Appointments]
+      summary: Crear una cita médica
+      description: >
+        Recibe una solicitud de cita, la persiste en estado PENDING en Cosmos DB
+        y publica un evento en Service Bus para su procesamiento asíncrono por
+        el worker del país correspondiente (PE o CL).
+      operationId: createAppointment
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAppointmentRequest'
+            examples:
+              example:
+                summary: Nueva cita
+                value:
+                  insuredId: "12345"
+                  scheduleId: 10
+      responses:
+        '202':
+          description: Cita recibida y encolada para procesamiento
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAppointmentResponse'
+        '400':
+          description: Request inválido (campos faltantes)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "Invalid request: insuredId and scheduleId>=1 are required"
+        '401':
+          description: Token JWT ausente, inválido o expirado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Error interno
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /appointments/{id}:
+    get:
+      tags: [Appointments]
+      summary: Obtener citas de un asegurado (paginado)
+      description: >
+        Retorna una página de citas (PENDING y COMPLETED) asociadas al insuredId dado,
+        consultando Cosmos DB con cursor-based pagination. Usa el campo `nextCursor`
+        de la respuesta como valor del parámetro `cursor` en la siguiente llamada.
+        En este endpoint, {id} corresponde al insuredId del asegurado.
+      operationId: getAppointments
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador del asegurado (insuredId)
+          schema:
+            type: string
+            example: "12345"
+        - name: pageSize
+          in: query
+          required: false
+          description: Número de ítems por página (default 20, máximo 100)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+            example: 20
+        - name: cursor
+          in: query
+          required: false
+          description: Continuation token obtenido del campo nextCursor de una respuesta anterior
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Página de citas del asegurado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppointmentPage'
+              examples:
+                primera_pagina:
+                  summary: Primera página con más resultados
+                  value:
+                    items:
+                      - appointmentId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                        insuredId: "12345"
+                        scheduleId: 10
+                        status: "completed"
+                        createdAt: "2026-06-28T15:30:00Z"
+                        completedAt: "2026-06-28T15:30:05Z"
+                    nextCursor: "eyJpZCI6ImExYjJjM2Q0In0="
+                ultima_pagina:
+                  summary: Última página (sin más resultados)
+                  value:
+                    items:
+                      - appointmentId: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+                        insuredId: "12345"
+                        scheduleId: 22
+                        status: "pending"
+                        createdAt: "2026-06-28T16:00:00Z"
+                        completedAt: null
+                    nextCursor: null
+        '400':
+          description: insuredId vacío o ausente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Token JWT ausente, inválido o expirado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Error interno
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /appointments/{id}/history:
+    get:
+      tags: [Appointments]
+      summary: Historial de eventos de una cita
+      description: >
+        Retorna el log de eventos inmutables de una cita ordenados por fecha de ocurrencia.
+        Cada transición de estado genera un documento de evento en Cosmos DB que nunca se modifica.
+        En este endpoint, {id} corresponde al UUID de la cita (appointmentId).
+      operationId: getAppointmentHistory
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID de la cita (appointmentId)
+          schema:
+            type: string
+            format: uuid
+            example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+      responses:
+        '200':
+          description: Lista de eventos ordenada cronológicamente
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AppointmentEventRecord'
+              example:
+                - eventId: "e1f2a3b4-c5d6-7890-abcd-ef1234567890"
+                  appointmentId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  eventType: "APPOINTMENT_CREATED"
+                  insuredId: "12345"
+                  scheduleId: 10
+                  status: "pending"
+                  occurredAt: "2026-06-28T15:30:00Z"
+                - eventId: "f2a3b4c5-d6e7-8901-bcde-f12345678901"
+                  appointmentId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                  eventType: "APPOINTMENT_COMPLETED"
+                  insuredId: "12345"
+                  scheduleId: 10
+                  status: "completed"
+                  occurredAt: "2026-06-28T15:30:05Z"
+        '400':
+          description: appointmentId vacío o ausente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Token JWT ausente, inválido o expirado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: Error interno
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    CreateAppointmentRequest:
+      type: object
+      required: [insuredId, scheduleId]
+      properties:
+        insuredId:
+          type: string
+          description: Identificador único del asegurado
+          example: "12345"
+        scheduleId:
+          type: integer
+          minimum: 1
+          description: ID del horario seleccionado
+          example: 10
+        contactEmail:
+          type: string
+          format: email
+          description: Email del asegurado para notificaciones (opcional)
+          example: "paciente@ejemplo.com"
+
+    CreateAppointmentResponse:
+      type: object
+      properties:
+        appointmentId:
+          type: string
+          format: uuid
+          description: UUID generado para la cita
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        message:
+          type: string
+          example: "Appointment received"
+        status:
+          type: string
+          example: "pending"
+
+    Appointment:
+      type: object
+      properties:
+        appointmentId:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        insuredId:
+          type: string
+          example: "12345"
+        scheduleId:
+          type: integer
+          example: 10
+        status:
+          type: string
+          enum: [pending, completed]
+          example: "completed"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2026-06-28T15:30:00Z"
+        completedAt:
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-06-28T15:30:05Z"
+
+    AppointmentPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Appointment'
+          description: Citas de la página actual
+        nextCursor:
+          type: string
+          nullable: true
+          description: Token para obtener la siguiente página; null si no hay más resultados
+          example: "eyJpZCI6ImExYjJjM2Q0In0="
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN]
+          description: Estado agregado del servicio
+          example: "UP"
+        checks:
+          type: object
+          description: Estado individual de cada dependencia
+          additionalProperties:
+            type: string
+          example:
+            cosmosDb: "UP"
+            azureSql: "UP"
+            serviceBus: "UP"
+        timestamp:
+          type: string
+          format: date-time
+          description: Momento en que se ejecutó la verificación
+          example: "2026-06-28T15:00:00Z"
+
+    AppointmentEventRecord:
+      type: object
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        appointmentId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+          enum: [APPOINTMENT_CREATED, APPOINTMENT_COMPLETED]
+        insuredId:
+          type: string
+        scheduleId:
+          type: integer
+        status:
+          type: string
+          enum: [PENDING, COMPLETED]
+        occurredAt:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Mensaje descriptivo del error
+          example: "Internal error processing appointment"
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT HS256 firmado con el secreto JWT_SECRET (Key Vault). Verificado en cada
+        Function por AuthGuard/JwtValidator — no depende de que API Management esté
+        desplegado. No requerido en /health.

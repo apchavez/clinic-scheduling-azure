@@ -1,0 +1,79 @@
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to delete"
+        required: true
+        type: choice
+        options: [dev, test, prod]
+      confirm:
+        description: "Type DELETE to confirm resource group deletion"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  destroy:
+    name: Delete Azure resource group
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Validate confirmation
+        if: inputs.confirm != 'DELETE'
+        run: |
+          echo "Confirmation did not match DELETE."
+          exit 1
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete resource group
+        uses: azure/cli@v3
+        with:
+          inlineScript: |
+            set -euo pipefail
+            RG_NAME="rg-clinic-${{ inputs.environment }}"
+            if az group show --name "$RG_NAME" >/dev/null 2>&1; then
+              az group delete --name "$RG_NAME" --yes
+            else
+              echo "Resource group $RG_NAME does not exist."
+            fi
+
+      - name: Purge soft-deleted Key Vaults
+        uses: azure/cli@v3
+        with:
+          inlineScript: |
+            set -euo pipefail
+            # Key Vault names survive resource-group deletion in a soft-deleted state
+            # (no ongoing cost, but they block re-creating a vault with the same name
+            # on the next deploy). Purge any left over from this environment's prefix.
+            for vault in $(az keyvault list-deleted --query "[?starts_with(name, 'kv-clinic-${{ inputs.environment }}-')].name" -o tsv); do
+              location=$(az keyvault list-deleted --query "[?name=='$vault'].properties.location" -o tsv)
+              echo "Purging soft-deleted Key Vault: $vault ($location)"
+              az keyvault purge --name "$vault" --location "$location"
+            done
+
+      - name: Purge soft-deleted API Management
+        uses: azure/cli@v3
+        with:
+          inlineScript: |
+            set -euo pipefail
+            # Like Key Vault, APIM service names survive resource-group deletion in a
+            # soft-deleted state (ServiceAlreadyExistsInSoftDeletedState) and block re-creating
+            # a service with the same name on the next deploy. Purge any left over from this
+            # environment's prefix.
+            for svc in $(az apim deletedservice list --query "[?starts_with(name, 'apim-clinic-${{ inputs.environment }}-')].name" -o tsv); do
+              location=$(az apim deletedservice list --query "[?name=='$svc'].location" -o tsv)
+              echo "Purging soft-deleted API Management: $svc ($location)"
+              az apim deletedservice purge --service-name "$svc" --location "$location"
+            done

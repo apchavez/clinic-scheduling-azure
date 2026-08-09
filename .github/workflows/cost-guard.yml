@@ -1,0 +1,80 @@
+name: Cost Guard
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily, 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: "Destroy the dev resource group if older than this many hours"
+        required: true
+        default: "48"
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+  id-token: write
+  issues: write
+
+jobs:
+  check-and-destroy:
+    name: Check resource group age, auto-destroy if stale
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Ensure cost-guard label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create cost-guard --repo "${{ github.repository }}" \
+            --color FBCA04 --description "Auto-destroyed by the Cost Guard workflow" 2>/dev/null || true
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Check resource group age and trigger destroy if stale
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '48' }}
+        run: |
+          RG_NAME="rg-clinic-dev"
+
+          if ! az group show --name "$RG_NAME" >/dev/null 2>&1; then
+            echo "No live '$RG_NAME' resource group found — nothing to do."
+            exit 0
+          fi
+
+          az extension add --name resource-graph -y --only-show-errors
+
+          CREATION=$(az graph query -q \
+            "ResourceContainers | where type=='microsoft.resources/subscriptions/resourcegroups' and name=='$RG_NAME' | project createdTime=tostring(properties.createdTime)" \
+            --query "data[0].createdTime" -o tsv)
+
+          if [ -z "$CREATION" ] || [ "$CREATION" = "None" ]; then
+            echo "Resource group exists but creation time is unavailable — leaving it up, check manually."
+            exit 0
+          fi
+
+          CREATION_EPOCH=$(date -d "$CREATION" +%s)
+          NOW_EPOCH=$(date -u +%s)
+          AGE_HOURS=$(( (NOW_EPOCH - CREATION_EPOCH) / 3600 ))
+          echo "Resource group '$RG_NAME' created at $CREATION, age ${AGE_HOURS}h (limit ${MAX_AGE_HOURS}h)."
+
+          if [ "$AGE_HOURS" -lt "$MAX_AGE_HOURS" ]; then
+            echo "Within allowed age, leaving it up."
+            exit 0
+          fi
+
+          echo "Resource group exceeds ${MAX_AGE_HOURS}h — triggering Destroy workflow."
+          gh workflow run destroy.yml --repo "${{ github.repository }}" \
+            -f environment=dev -f confirm=DELETE
+
+          gh issue create --repo "${{ github.repository }}" \
+            --title "Cost Guard: auto-destroyed stale dev resource group ($(date -u +%Y-%m-%d))" \
+            --body "\`$RG_NAME\` was created at $CREATION (age ${AGE_HOURS}h, limit ${MAX_AGE_HOURS}h) and has been automatically torn down by [Cost Guard](../actions/workflows/cost-guard.yml) to avoid ongoing Azure charges. Redeploy on demand via the Deploy workflow." \
+            --label "cost-guard"

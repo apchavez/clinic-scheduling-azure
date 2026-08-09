@@ -1,0 +1,21 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "COSMOS_ENDPOINT": "<your-cosmos-endpoint>",
+    "COSMOS_DATABASE": "clinicdb",
+    "COSMOS_CONTAINER": "appointments",
+    "COSMOS_EVENTS_CONTAINER": "appointment-events",
+    "SERVICEBUS__fullyQualifiedNamespace": "<your-sb-namespace>.servicebus.windows.net",
+    "SERVICEBUS_CREATED_TOPIC": "appointment-created",
+    "EVENTGRID_TOPIC_ENDPOINT": "<your-eventgrid-topic-endpoint>",
+    "SQL_HOST": "<your-sql-server>.database.windows.net",
+    "SQL_DATABASE": "clinicdb",
+    "SQL_USER": "<your-sql-user>",
+    "SQL_PASSWORD": "<your-sql-password>",
+    "JWT_SECRET": "<your-jwt-secret>",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "<your-app-insights-connection-string>"
+  }
+}

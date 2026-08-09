@@ -1,0 +1,184 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, test, prod]
+        default: dev
+      deploy_api_management:
+        description: "Deploy API Management facade"
+        required: true
+        type: boolean
+        default: true
+      enable_apim_jwt:
+        description: "Enable JWT validation policy in APIM"
+        required: true
+        type: boolean
+        default: false
+      run_integration_tests:
+        description: "Run Postman integration tests after deploy"
+        required: true
+        type: boolean
+        default: true
+      deploy_alerts:
+        description: "Deploy Azure Monitor email alerts"
+        required: true
+        type: boolean
+        default: false
+      allow_public_network_access:
+        description: "Allow public network access to cloud data services (must stay true — no VNet/Private Endpoints exist, see README design note)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy Azure resources and Functions
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Azure login
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install dependencies and test
+        run: |
+          pip install -r requirements-dev.txt
+          ruff format --check .
+          ruff check .
+          pytest --cov=clinic.domain --cov=clinic.application --cov-fail-under=80
+
+      - name: Deploy infrastructure
+        id: infra
+        uses: azure/cli@v3
+        with:
+          inlineScript: |
+            set -euo pipefail
+            PARAM_FILE="infra/parameters.${{ inputs.environment }}.json"
+            DEPLOYMENT_NAME="clinic-${{ inputs.environment }}-${{ github.run_number }}"
+            az deployment sub create \
+              --location eastus \
+              --template-file infra/main.bicep \
+              --parameters "$PARAM_FILE" \
+              --parameters sqlAdminPassword='${{ secrets.SQL_ADMIN_PASSWORD }}' \
+              --parameters jwtSecret='${{ secrets.JWT_SECRET }}' \
+              --parameters deployApiManagement=${{ inputs.deploy_api_management }} \
+              --parameters enableApiManagementJwtValidation=${{ inputs.enable_apim_jwt }} \
+              --parameters apiManagementJwtOpenIdConfigUrl='${{ vars.APIM_JWT_OPENID_CONFIG_URL }}' \
+              --parameters apiManagementJwtAudience='${{ vars.APIM_JWT_AUDIENCE }}' \
+              --parameters deployAlerts=${{ inputs.deploy_alerts }} \
+              --parameters alertEmail='${{ vars.ALERT_EMAIL }}' \
+              --parameters allowPublicNetworkAccess=${{ inputs.allow_public_network_access }} \
+              --name "$DEPLOYMENT_NAME"
+            az deployment sub show --name "$DEPLOYMENT_NAME" --query properties.outputs --output json > deployment-outputs.json
+            echo "function_app=$(az deployment sub show --name "$DEPLOYMENT_NAME" --query properties.outputs.functionAppName.value --output tsv)" >> "$GITHUB_OUTPUT"
+            echo "resource_group=$(az deployment sub show --name "$DEPLOYMENT_NAME" --query properties.outputs.resourceGroup.value --output tsv)" >> "$GITHUB_OUTPUT"
+            echo "apim_url=$(az deployment sub show --name "$DEPLOYMENT_NAME" --query properties.outputs.apiManagementGatewayUrl.value --output tsv)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Azure Functions Core Tools
+        run: npm install --global azure-functions-core-tools@4 --unsafe-perm true
+
+      - name: Deploy Function App
+        run: |
+          pip install -r requirements.txt --target=".python_packages/lib/site-packages"
+          for attempt in 1 2 3; do
+            if func azure functionapp publish "${{ steps.infra.outputs.function_app }}" --python --no-build; then
+              exit 0
+            fi
+            echo "Publish attempt $attempt failed (likely a transient post-upload connectivity race while the Function App finishes warming up) — retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::Function App publish failed after 3 attempts"
+          exit 1
+
+      - name: Wait for Function App to finish warming up
+        if: inputs.run_integration_tests
+        run: |
+          URL="https://${{ steps.infra.outputs.function_app }}.azurewebsites.net/api/health"
+          for attempt in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "Function App is up (attempt $attempt, $URL returned 200)"
+              exit 0
+            fi
+            echo "Attempt $attempt: $URL returned $CODE (Python worker likely still indexing functions after publish) — retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Function App never became healthy after publish (20 attempts / ~200s)"
+          exit 1
+
+      - name: Install Newman
+        if: inputs.run_integration_tests
+        run: npm install --global newman
+
+      - name: Generate test JWT
+        if: inputs.run_integration_tests
+        id: jwt
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          TOKEN=$(node -e '
+            const crypto = require("crypto");
+            const b64url = (buf) => buf.toString("base64url");
+            const header = b64url(Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+            const payload = b64url(Buffer.from(JSON.stringify({
+              sub: "deploy-integration-tests",
+              role: "agent",
+              exp: Math.floor(Date.now() / 1000) + 3600,
+            })));
+            const sig = crypto.createHmac("sha256", process.env.JWT_SECRET)
+              .update(`${header}.${payload}`)
+              .digest("base64url");
+            console.log(`${header}.${payload}.${sig}`);
+          ')
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Run integration tests
+        if: inputs.run_integration_tests
+        run: |
+          BASE_URL="https://${{ steps.infra.outputs.function_app }}.azurewebsites.net/api"
+          if [ "${{ inputs.enable_apim_jwt }}" = "false" ] && [ -n "${{ steps.infra.outputs.apim_url }}" ] && [ "${{ steps.infra.outputs.apim_url }}" != "null" ]; then
+            BASE_URL="${{ steps.infra.outputs.apim_url }}/clinic"
+          fi
+          newman run postman/azure-python.postman_collection.json \
+            --env-var baseUrl="$BASE_URL" \
+            --env-var token="${{ steps.jwt.outputs.token }}" \
+            --reporters cli,junit \
+            --reporter-junit-export newman-results.xml
+
+      - name: Upload deployment outputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-outputs-${{ inputs.environment }}
+          path: |
+            deployment-outputs.json
+            newman-results.xml
+          if-no-files-found: warn
